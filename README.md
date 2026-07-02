@@ -1,1 +1,55 @@
-# lol-he-
+# LiftLab — Muscle Growth & Nutrition Planner
+
+A self-contained fitness app that plans your training for optimal muscle growth, tells you
+how many calories to eat, what to eat and in what portions, tracks your weight and
+measurements, and **automatically adjusts your calories** based on how your weight actually
+responds.
+
+**No install, no account, no server.** Open `index.html` in any modern browser — everything
+is stored locally in your browser (with JSON export/import for backups).
+
+## Features
+
+### 🏋️ Workout planner
+- Evidence-based hypertrophy programs for **2–6 training days per week**
+  (Full Body, Upper/Lower, U/L + PPL hybrid, Push/Pull/Legs ×2)
+- Sets, rep ranges, RIR (reps in reserve) and rest times per exercise
+- Scales volume to your experience level (beginner / intermediate / advanced)
+- Equipment-aware: full gym, dumbbells-only, or home/minimal variants for every exercise
+- Weekly sets-per-muscle audit against the 10–20 set hypertrophy guideline
+- Built-in progression rules (double progression + deload guidance)
+
+### 🍽️ Nutrition
+- Calorie target from **Mifflin-St Jeor BMR × activity**, adjusted for your goal
+- Choose **lose fat (cut)** or **gain muscle (lean bulk)** at a chosen pace (% body weight/week), or maintain
+- Macro targets: protein by body weight (lean-mass-based when body-fat % is high), fat floor, carbs fill the rest
+- **Meal plan generator**: builds each meal from a 50+ whole-food database and solves the
+  portion size *per food* to hit your targets (supports omnivore / vegetarian / vegan, 3–5 meals/day)
+- **Portion calculator**: pick any food and size a portion by grams, protein, or calories
+- Safety floors on calories with clear warnings
+
+### 📈 Tracking & adaptive calories
+- Daily weigh-in log with an SVG chart: daily points + **7-day trend line** + goal-weight line,
+  crosshair tooltip, 30/90-day/All ranges, and a table view
+- Body measurements (waist, chest, hips, arm, thigh)
+- **Adaptive coach**: once you have ≥8 weigh-ins across 12+ days, a check-in compares your
+  *measured* weekly rate of change (regression over recent weigh-ins) with your *target* rate
+  and adjusts calories (capped at ±250 kcal per adjustment), keeping a full history
+
+## The math
+
+| Quantity | Method |
+|---|---|
+| BMR | Mifflin-St Jeor |
+| TDEE | BMR × activity multiplier (1.2–1.9) |
+| Goal delta | pace (% BW/week) × 7,700 kcal per kg ÷ 7 |
+| Protein | 1.8–2.2 g/kg (lean mass when BF% is high) |
+| Fat | max(25% of calories, 0.5 g/kg) |
+| Carbs | remaining calories |
+| Trend weight | 7-day moving average |
+| Measured rate | least-squares slope of recent weigh-ins (kg/week) |
+
+## Disclaimer
+
+Estimates only — not medical advice. Consult a professional before major diet or training
+changes, especially with any health condition.
