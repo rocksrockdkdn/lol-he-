@@ -3,6 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#0d0d0d">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="LiftLab">
 <title>LiftLab — Muscle Growth & Nutrition Planner</title>
 <style>
   :root{
@@ -218,7 +225,10 @@ function defaultState(){
     measurements: [],   // [{d, waist, chest, hips, arm, thigh}] cm, sorted
     coach: { adjKcal: 0, lastCheck: null, history: [] },
     mealPlan: null,     // {kcalAtGen, meals:[...], totals:{}}
-    ui: { chartRange: 90, chartTable: false },
+    ui: { chartRange: 90, chartTable: false, waterGoalMl: 3000 },
+    workoutLogs: [],     // [{d, key, title, entries:[{name, sets:[{w,reps}]}]}] sorted by d
+    foodLog: [],          // [{d, items:[{name, g}]}] one entry per day
+    water: [],             // [{d, ml}] one entry per day
   };
 }
 
@@ -323,6 +333,8 @@ function sanitizeState(raw){
   const cr = Number(ru.chartRange);
   out.ui.chartRange = [0,30,90].includes(cr) ? cr : 90;
   out.ui.chartTable = !!ru.chartTable;
+  const wg = Number(ru.waterGoalMl);
+  out.ui.waterGoalMl = finite(wg) ? clamp(wg,250,10000) : 3000;
 
   // ---- mealPlan ----
   const rmp = raw.mealPlan;
@@ -352,6 +364,54 @@ function sanitizeState(raw){
   } else {
     out.mealPlan = null;
   }
+
+  // ---- workoutLogs ----
+  const rawLogs = Array.isArray(raw.workoutLogs) ? raw.workoutLogs : [];
+  out.workoutLogs = rawLogs
+    .filter(s => s && typeof s==='object' && dateRe.test(s.d))
+    .map(s => {
+      const rawEntries = Array.isArray(s.entries) ? s.entries : [];
+      const entries = rawEntries.slice(0,60).map(en=>{
+        en = (en && typeof en==='object') ? en : {};
+        const rawSets = Array.isArray(en.sets) ? en.sets : [];
+        const sets = rawSets.slice(0,60).map(st=>{
+          st = (st && typeof st==='object') ? st : {};
+          return { w: clamp(numOr0(st.w),0,2000), reps: clamp(numOr0(st.reps),0,1000) };
+        });
+        return { name: String(en.name||'').slice(0,80), sets };
+      }).filter(en => en.name && en.sets.length);
+      return {
+        d: s.d,
+        key: String(s.key||'').slice(0,80),
+        title: String(s.title||'').slice(0,80),
+        entries,
+      };
+    })
+    .sort((a,b)=> a.d<b.d?-1:a.d>b.d?1:0)
+    .slice(-5000);
+
+  // ---- foodLog ----
+  const rawFoodLog = Array.isArray(raw.foodLog) ? raw.foodLog : [];
+  out.foodLog = rawFoodLog
+    .filter(fl => fl && typeof fl==='object' && dateRe.test(fl.d))
+    .map(fl => {
+      const rawItems = Array.isArray(fl.items) ? fl.items : [];
+      const items = rawItems.slice(0,100).map(it=>{
+        it = (it && typeof it==='object') ? it : {};
+        return { name: String(it.name||'').slice(0,80), g: clamp(numOr0(it.g),0,5000) };
+      }).filter(it => it.name);
+      return { d: fl.d, items };
+    })
+    .sort((a,b)=> a.d<b.d?-1:a.d>b.d?1:0)
+    .slice(-3660);
+
+  // ---- water ----
+  const rawWater = Array.isArray(raw.water) ? raw.water : [];
+  out.water = rawWater
+    .filter(w => w && typeof w==='object' && dateRe.test(w.d))
+    .map(w => ({ d: w.d, ml: clamp(numOr0(w.ml),0,30000) }))
+    .sort((a,b)=> a.d<b.d?-1:a.d>b.d?1:0)
+    .slice(-3660);
 
   return out;
 }
@@ -978,6 +1038,136 @@ function generateMealPlan(){
 state = loadState();
 
 /* ============================================================
+   FEATURE HELPERS — workout logging, rest timer, food diary, water
+   ============================================================ */
+const ML_PER_OZ = 29.5735;
+
+function getOrCreateFoodDay(d){
+  let entry = state.foodLog.find(f=>f.d===d);
+  if(!entry){ entry = {d, items:[]}; state.foodLog.push(entry); state.foodLog.sort((a,b)=>a.d<b.d?-1:a.d>b.d?1:0); }
+  return entry;
+}
+function foodLookup(name){ return FOODS.find(f=>f.name===name) || null; }
+
+function getOrCreateWaterDay(d){
+  let entry = state.water.find(w=>w.d===d);
+  if(!entry){ entry = {d, ml:0}; state.water.push(entry); state.water.sort((a,b)=>a.d<b.d?-1:a.d>b.d?1:0); }
+  return entry;
+}
+
+// Most recent previously-logged top (heaviest) set for an exercise, across all sessions.
+function lastTopSetFor(exName){
+  for(let i=state.workoutLogs.length-1;i>=0;i--){
+    const en = state.workoutLogs[i].entries.find(e=>e.name===exName);
+    if(en && en.sets.length){
+      let best = en.sets[0];
+      for(const st of en.sets) if(st.w>best.w) best = st;
+      return best; // {w,reps} — w in kg
+    }
+  }
+  return null;
+}
+
+// Workout-log-in-progress UI state. Deliberately NOT persisted — it only becomes
+// part of state.workoutLogs once the user hits "Save session".
+let workoutLogUI = { dayIdx: null, pending: {} };
+
+// Rest timer — a single persistent module-scoped timer + interval so repeated
+// tab re-renders (triggered by every save/add-set) never spawn duplicate intervals.
+let restTimer = { presetMs: 90000, remainingMs: 90000, running: false, endAt: null, audioCtx: null };
+let restTimerIntervalId = null;
+function fmtMMSS(ms){
+  const s = Math.max(0, Math.round(ms/1000));
+  return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
+}
+function ensureAudioCtx(){
+  if(!restTimer.audioCtx){
+    try{ restTimer.audioCtx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){}
+  }
+  if(restTimer.audioCtx && restTimer.audioCtx.state==='suspended'){ restTimer.audioCtx.resume().catch(()=>{}); }
+}
+function playBeep(){
+  const ctx = restTimer.audioCtx;
+  if(!ctx) return;
+  try{
+    const osc = ctx.createOscillator(), gain = ctx.createGain();
+    osc.frequency.value = 880;
+    osc.connect(gain); gain.connect(ctx.destination);
+    gain.gain.setValueAtTime(0.2, ctx.currentTime);
+    osc.start();
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime+0.4);
+    osc.stop(ctx.currentTime+0.4);
+  }catch(e){}
+}
+function onRestTimerDone(){
+  try{ navigator.vibrate?.(200); }catch(e){}
+  playBeep();
+}
+function updateRestTimerDisplay(){
+  const el = $('#restDisplay'); if(el) el.textContent = fmtMMSS(restTimer.remainingMs);
+  const btn = $('#restToggleBtn'); if(btn) btn.textContent = restTimer.running?'Pause':'Start';
+}
+function ensureRestTimerInterval(){
+  if(restTimerIntervalId != null) return;
+  restTimerIntervalId = setInterval(()=>{
+    if(!restTimer.running) return;
+    const remaining = restTimer.endAt - Date.now();
+    if(remaining<=0){
+      restTimer.running = false; restTimer.remainingMs = 0; restTimer.endAt = null;
+      updateRestTimerDisplay();
+      onRestTimerDone();
+    } else {
+      restTimer.remainingMs = remaining;
+      updateRestTimerDisplay();
+    }
+  }, 250);
+}
+function restTimerSetPreset(sec){
+  restTimer.presetMs = sec*1000; restTimer.remainingMs = sec*1000;
+  restTimer.running = false; restTimer.endAt = null;
+  updateRestTimerDisplay();
+}
+function restTimerToggle(){
+  ensureAudioCtx();
+  if(restTimer.running){
+    restTimer.remainingMs = Math.max(0, restTimer.endAt - Date.now());
+    restTimer.running = false; restTimer.endAt = null;
+  } else {
+    if(restTimer.remainingMs<=0) restTimer.remainingMs = restTimer.presetMs || 90000;
+    restTimer.endAt = Date.now() + restTimer.remainingMs;
+    restTimer.running = true;
+  }
+  updateRestTimerDisplay();
+}
+function restTimerReset(){
+  restTimer.running = false; restTimer.endAt = null;
+  restTimer.remainingMs = restTimer.presetMs || 90000;
+  updateRestTimerDisplay();
+}
+function renderRestTimer(){
+  const box = $('#restTimerBox'); if(!box) return;
+  box.innerHTML = `
+    <div class="card" style="margin-bottom:0">
+      <h3>⏱️ Rest timer</h3>
+      <div class="btnrow mt">
+        <button type="button" class="btn ghost small" data-restpreset="60">60s</button>
+        <button type="button" class="btn ghost small" data-restpreset="90">90s</button>
+        <button type="button" class="btn ghost small" data-restpreset="120">2 min</button>
+        <button type="button" class="btn ghost small" data-restpreset="180">3 min</button>
+      </div>
+      <div class="hero-num mt" id="restDisplay" style="font-size:32px">${fmtMMSS(restTimer.remainingMs)}</div>
+      <div class="btnrow mt">
+        <button type="button" class="btn small" id="restToggleBtn">${restTimer.running?'Pause':'Start'}</button>
+        <button type="button" class="btn ghost small" id="restResetBtn">Reset</button>
+      </div>
+    </div>`;
+  box.querySelectorAll('[data-restpreset]').forEach(b=>b.addEventListener('click', ()=>restTimerSetPreset(+b.dataset.restpreset)));
+  $('#restToggleBtn').addEventListener('click', restTimerToggle);
+  $('#restResetBtn').addEventListener('click', restTimerReset);
+  ensureRestTimerInterval();
+}
+
+/* ============================================================
    RENDERING
    ============================================================ */
 const tabs = ['dashboard','workout','nutrition','progress','profile'];
@@ -1030,6 +1220,16 @@ function renderDashboard(){
       deltaHtml = `<div class="delta"><span class="${isGood?'up-good':'down-bad'}">${d>=0?'▲':'▼'} ${Math.abs(kgOut(d,1))} ${wUnit()}</span> vs a week ago</div>`;
     }
   }
+
+  // ---- water ----
+  const todayWaterEntry = state.water.find(w=>w.d===todayISO());
+  const waterMl = todayWaterEntry ? todayWaterEntry.ml : 0;
+  const waterGoalMl = state.ui.waterGoalMl || 3000;
+  const waterPct = waterGoalMl>0 ? waterMl/waterGoalMl*100 : 0;
+  const waterDisp = isImperial() ? `${round(waterMl/ML_PER_OZ,0)} oz` : `${round(waterMl/1000,2)} L`;
+  const waterGoalDisp = isImperial() ? `${round(waterGoalMl/ML_PER_OZ,0)} oz` : `${round(waterGoalMl/1000,1)} L`;
+  const waterStepMl = isImperial() ? round(8*ML_PER_OZ,0) : 250;
+  const waterStepLabel = isImperial() ? '8 oz' : '250 ml';
 
   c.innerHTML = `
     <h1>Today</h1>
@@ -1089,12 +1289,34 @@ function renderDashboard(){
         ${Number(lastAdj.adj)===0?'on track, no change.':`adjusted <b>${Number(lastAdj.adj)>0?'+':''}${Number(lastAdj.adj)} kcal</b> (${Number(lastAdj.before).toLocaleString()} → ${Number(lastAdj.after).toLocaleString()}).`}
         ${lastAdj.waistDelta!=null?` Waist ${lastAdj.waistDelta>0?'+':''}${cmOut(lastAdj.waistDelta,1)} ${lUnit()} since previous measurement.`:''}</div>`:''}
     </div>
+
+    <div class="card">
+      <h2>💧 Water</h2>
+      <div class="meterrow">
+        <div class="mr-top"><span>Today</span><span>${waterDisp} / ${waterGoalDisp}</span></div>
+        <div class="meter"><i class="${waterPct>112?'over':''}" style="width:${clamp(waterPct,0,100)}%"></i></div>
+      </div>
+      <div class="btnrow mt">
+        <button type="button" class="btn ghost small" id="btnWaterMinus">− ${waterStepLabel}</button>
+        <button type="button" class="btn ghost small" id="btnWaterPlus">+ ${waterStepLabel}</button>
+      </div>
+    </div>
   `;
   $('#btnCheckIn') && $('#btnCheckIn').addEventListener('click', ()=>{
     const rec = runCheckIn();
     if(rec){ renderAll(); }
   });
   $('#btnQuickWeighD') && $('#btnQuickWeighD').addEventListener('click', ()=>{ switchTab('progress'); $('#wInput') && $('#wInput').focus(); });
+  $('#btnWaterPlus') && $('#btnWaterPlus').addEventListener('click', ()=>{
+    const entry = getOrCreateWaterDay(todayISO());
+    entry.ml = clamp(entry.ml + waterStepMl, 0, 30000);
+    saveState(); renderDashboard();
+  });
+  $('#btnWaterMinus') && $('#btnWaterMinus').addEventListener('click', ()=>{
+    const entry = getOrCreateWaterDay(todayISO());
+    entry.ml = clamp(entry.ml - waterStepMl, 0, 30000);
+    saveState(); renderDashboard();
+  });
 }
 
 /* ---------- workout tab ---------- */
@@ -1123,6 +1345,52 @@ function renderWorkout(){
     return `<tr><td>${MUSCLES[m]}</td><td class="num">${s}</td><td><span class="badge ${status[1]}">${status[0]}</span></td></tr>`;
   }).join('');
 
+  // ---- log-a-session card ----
+  if(workoutLogUI.dayIdx!=null && !prog.days[workoutLogUI.dayIdx]) workoutLogUI.dayIdx = null;
+  const dayOptions = prog.days.map((d,i)=>
+    `<option value="${i}" ${workoutLogUI.dayIdx===i?'selected':''}>Day ${i+1} — ${esc(d.title)}</option>`).join('');
+  let logBody;
+  if(workoutLogUI.dayIdx==null){
+    logBody = `<p class="sec" style="font-size:13.5px">Pick a day above to log today's sets.</p>`;
+  } else {
+    const day = prog.days[workoutLogUI.dayIdx];
+    const exRows = day.exs.map(e=>{
+      const pend = workoutLogUI.pending[e.name] || [];
+      const last = lastTopSetFor(e.name);
+      const chips = pend.length
+        ? pend.map((st,si)=>`<span class="chip">${kgOut(st.w,1)} ${wUnit()} × ${Number(st.reps)} <a href="#" data-rmidx="${si}" style="color:inherit;text-decoration:none;margin-left:4px">✕</a></span>`).join('')
+        : `<span class="muted" style="font-size:12.5px">No sets added yet.</span>`;
+      return `<div class="logex mt" data-exname="${esc(e.name)}" style="padding-bottom:12px;border-bottom:1px solid var(--grid)">
+        <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px">
+          <div><b>${esc(e.name)}</b> <span class="unit-hint">${e.sets}×${e.reps}</span></div>
+          <div class="muted" style="font-size:12.5px">${last?`last: ${kgOut(last.w,1)} ${wUnit()} × ${Number(last.reps)}`:'no history yet'}</div>
+        </div>
+        <div class="row mt" style="align-items:end">
+          <div class="field" style="max-width:110px"><label class="f">Weight (${wUnit()})</label><input type="number" min="0" step="0.5" class="logW"></div>
+          <div class="field" style="max-width:90px"><label class="f">Reps</label><input type="number" min="0" step="1" class="logReps"></div>
+          <div class="field" style="flex:0"><button type="button" class="btn ghost small" data-addset>+ Add set</button></div>
+        </div>
+        <div class="mt">${chips}</div>
+      </div>`;
+    }).join('');
+    logBody = exRows + `<div class="btnrow mt"><button type="button" class="btn" id="btnSaveSession">💾 Save session</button></div>`;
+  }
+  const recentSessions = state.workoutLogs.slice(-10).reverse();
+  const recentHtml = recentSessions.length ? `<div class="scrollx"><table class="data">
+      <thead><tr><th>Date</th><th>Session</th><th class="num">Volume</th><th class="num">Best est. 1RM</th></tr></thead>
+      <tbody>${recentSessions.map(s=>{
+        let vol=0, best1rm=0;
+        for(const en of s.entries) for(const st of en.sets){
+          vol += st.w*st.reps;
+          const e1 = st.w*(1+st.reps/30);
+          if(e1>best1rm) best1rm = e1;
+        }
+        return `<tr><td>${fmtDateShort(s.d)}</td><td>${esc(s.title)}</td>
+          <td class="num">${kgOut(vol,0).toLocaleString()} ${wUnit()}</td>
+          <td class="num">${kgOut(best1rm,1)} ${wUnit()}</td></tr>`;
+      }).join('')}</tbody>
+    </table></div>` : `<p class="sec" style="font-size:13.5px">No sessions logged yet.</p>`;
+
   c.innerHTML = `
     <h1>Your training program</h1>
     <div class="sub">${(SPLITS[p.daysPerWeek]||SPLITS[3]).name} · ${p.daysPerWeek} days/week · ${esc(p.equipment==='gym'?'full gym':p.equipment==='dumbbell'?'dumbbells only':'home / minimal equipment')} · ${esc(p.experience)}</div>
@@ -1132,6 +1400,18 @@ function renderWorkout(){
       (<b>RIR</b> = reps in reserve — stop ${prog.rir} reps short of failure).</p></div>
 
     <div class="grid cols-2 mb">${dayCards}</div>
+
+    <div class="card">
+      <h2>📓 Log a session</h2>
+      <p class="sec" style="font-size:13.5px">Pick a program day, log your sets as you go, and save. LiftLab remembers your last top set so you know what to beat, plus tracks estimated 1RM (Epley formula) over time.</p>
+      <div class="field" style="max-width:340px"><label class="f">Program day</label>
+        <select id="logDaySelect"><option value="">— choose a day —</option>${dayOptions}</select>
+      </div>
+      <div id="restTimerBox" class="mt"></div>
+      <div class="mt">${logBody}</div>
+      <h3 class="mt">Recent sessions</h3>
+      ${recentHtml}
+    </div>
 
     <div class="grid cols-2">
       <div class="card">
@@ -1154,6 +1434,53 @@ function renderWorkout(){
       </div>
     </div>
   `;
+
+  renderRestTimer();
+
+  $('#logDaySelect').addEventListener('change', e=>{
+    const v = e.target.value;
+    workoutLogUI.dayIdx = v===''? null : +v;
+    workoutLogUI.pending = {};
+    renderWorkout();
+  });
+  $$('#tab-workout .logex').forEach(block=>{
+    const exName = block.dataset.exname;
+    const addBtn = block.querySelector('[data-addset]');
+    addBtn && addBtn.addEventListener('click', ()=>{
+      const wEl = block.querySelector('.logW'), rEl = block.querySelector('.logReps');
+      const wVal = parseFloat(wEl.value), rVal = parseFloat(rEl.value);
+      if(!(wVal>=0) || !(rVal>0)) return;
+      const kg = clamp(round(kgIn(wVal),2), 0, 2000);
+      if(!workoutLogUI.pending[exName]) workoutLogUI.pending[exName] = [];
+      workoutLogUI.pending[exName].push({ w: kg, reps: clamp(Math.round(rVal),0,1000) });
+      renderWorkout();
+    });
+    block.querySelectorAll('[data-rmidx]').forEach(x=>x.addEventListener('click', ev=>{
+      ev.preventDefault();
+      const idx = +x.dataset.rmidx;
+      if(workoutLogUI.pending[exName]) workoutLogUI.pending[exName].splice(idx,1);
+      renderWorkout();
+    }));
+  });
+  $('#btnSaveSession') && $('#btnSaveSession').addEventListener('click', ()=>{
+    if(workoutLogUI.dayIdx==null) return;
+    const day = prog.days[workoutLogUI.dayIdx];
+    if(!day) return;
+    const entries = day.exs
+      .map(e=>({ name: e.name, sets: (workoutLogUI.pending[e.name]||[]).slice(0,60) }))
+      .filter(en=>en.sets.length);
+    if(!entries.length){ alert('Add at least one set before saving.'); return; }
+    const dayKey = String(((SPLITS[p.daysPerWeek]||SPLITS[3]).days[workoutLogUI.dayIdx])||'');
+    const d = todayISO();
+    const session = { d, key: dayKey, title: day.title, entries };
+    const idx = state.workoutLogs.findIndex(s=>s.d===d && s.key===dayKey);
+    if(idx>=0) state.workoutLogs[idx] = session; else state.workoutLogs.push(session);
+    state.workoutLogs.sort((a,b)=> a.d<b.d?-1:a.d>b.d?1:0);
+    if(state.workoutLogs.length>5000) state.workoutLogs = state.workoutLogs.slice(-5000);
+    workoutLogUI.pending = {};
+    saveState();
+    renderWorkout();
+  });
 }
 
 /* ---------- nutrition tab ---------- */
@@ -1218,9 +1545,66 @@ function renderNutrition(){
     <td class="num">${f.kcal}</td><td class="num">${f.p}</td><td class="num">${f.c}</td><td class="num">${f.f}</td>
   </tr>`).join('');
 
+  // ---- today's intake diary ----
+  const todayFoodEntry = state.foodLog.find(fl=>fl.d===todayISO());
+  const todayItems = todayFoodEntry ? todayFoodEntry.items : [];
+  const consumed = {kcal:0,p:0,c:0,f:0};
+  const intakeRows = todayItems.map((it,i)=>{
+    const food = foodLookup(it.name);
+    const g = Number(it.g)||0;
+    if(food){
+      const m = macrosFor(food, g);
+      consumed.kcal+=m.kcal; consumed.p+=m.p; consumed.c+=m.c; consumed.f+=m.f;
+      return `<tr>
+        <td>${esc(it.name)}${food.unit?`<div class="unit-hint">${esc(food.unit)}</div>`:''}</td>
+        <td class="num">${g} g</td>
+        <td class="num">${Math.round(m.kcal)}</td>
+        <td class="num">${round(m.p)}</td>
+        <td class="num">${round(m.c)}</td>
+        <td class="num">${round(m.f)}</td>
+        <td class="num"><button type="button" class="btn ghost small" data-rmfood="${i}">✕</button></td>
+      </tr>`;
+    }
+    return `<tr>
+      <td>${esc(it.name)}<div class="unit-hint muted">unknown food</div></td>
+      <td class="num">${g} g</td>
+      <td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">0</td>
+      <td class="num"><button type="button" class="btn ghost small" data-rmfood="${i}">✕</button></td>
+    </tr>`;
+  }).join('');
+  const remainingKcal = mt.kcal - consumed.kcal;
+  const overPct = mt.kcal>0 ? consumed.kcal/mt.kcal : 0;
+  const remainingHtml = remainingKcal>=0
+    ? `${Math.round(remainingKcal).toLocaleString()} kcal remaining today`
+    : `Over by ${Math.round(Math.abs(remainingKcal)).toLocaleString()} kcal today`;
+  const intakeCard = `
+    <div class="card">
+      <h2>✅ Today's intake</h2>
+      <p class="sec" style="font-size:13.5px">Log what you actually eat to see how it stacks up against today's targets.</p>
+      <div class="row">
+        <div class="field" style="flex:2;min-width:200px"><label class="f">Food</label>
+          <select id="flFood">${FOODS.map((f,i)=>`<option value="${i}">${esc(f.name)}</option>`).join('')}</select></div>
+        <div class="field"><label class="f">Grams</label><input id="flGrams" type="number" min="0" step="5" placeholder="e.g. 150"></div>
+        <div class="field" style="align-self:end"><button type="button" class="btn" id="btnAddFood">Add</button></div>
+      </div>
+      ${todayItems.length ? `<div class="scrollx"><table class="data">
+        <thead><tr><th>Food</th><th class="num">Grams</th><th class="num">kcal</th><th class="num">P</th><th class="num">C</th><th class="num">F</th><th></th></tr></thead>
+        <tbody>${intakeRows}</tbody>
+      </table></div>` : `<p class="muted mt" style="font-size:12.5px">Nothing logged yet today.</p>`}
+      <div class="mt">
+        ${meterRow('Calories', consumed.kcal, mt.kcal, 'kcal')}
+        ${meterRow('Protein', consumed.p, mt.protein, 'g')}
+        ${meterRow('Carbs', consumed.c, mt.carbs, 'g')}
+        ${meterRow('Fat', consumed.f, mt.fat, 'g')}
+      </div>
+      <div class="note${overPct>1.10?' warn':''}"><b>${remainingHtml}</b></div>
+    </div>`;
+
   c.innerHTML = `
     <h1>Nutrition</h1>
     <div class="sub">Targets: ${mt.kcal.toLocaleString()} kcal · ${mt.protein} g protein · ${mt.carbs} g carbs · ${mt.fat} g fat</div>
+
+    ${intakeCard}
 
     <div class="card">
       <h2>🍽️ Today's meal plan</h2>
@@ -1296,6 +1680,23 @@ function renderNutrition(){
     const src = $('#pcGrams').value?'grams':$('#pcProt').value?'prot':$('#pcKcal').value?'kcal':null;
     if(src) pcUpdate(src);
   });
+
+  // today's intake diary
+  $('#btnAddFood').addEventListener('click', ()=>{
+    const idx = +$('#flFood').value;
+    const g = parseFloat($('#flGrams').value);
+    const food = FOODS[idx];
+    if(!food || !(g>0)) return;
+    const entry = getOrCreateFoodDay(todayISO());
+    entry.items.push({ name: food.name, g: clamp(round(g,0),0,5000) });
+    if(entry.items.length>100) entry.items = entry.items.slice(-100);
+    saveState(); renderNutrition();
+  });
+  $$('#tab-nutrition [data-rmfood]').forEach(b=>b.addEventListener('click', ()=>{
+    const i = +b.dataset.rmfood;
+    const entry = state.foodLog.find(fl=>fl.d===todayISO());
+    if(entry){ entry.items.splice(i,1); saveState(); renderNutrition(); }
+  }));
 }
 
 /* ---------- progress tab (weight chart + measurements) ---------- */
@@ -1629,6 +2030,10 @@ function renderProfile(){
         <label class="btn ghost" style="display:inline-block;cursor:pointer">Import backup<input type="file" id="btnImport" accept=".json,application/json" style="display:none"></label>
         <button class="btn ghost" id="btnReset" style="color:var(--critical)">Reset everything</button>
       </div>
+      <div class="btnrow mt">
+        <button class="btn ghost" id="btnInstallApp">📲 Install app</button>
+      </div>
+      <div class="note" style="font-size:12px">Installs as an app that works offline — your data stays on this device.</div>
     </div>
   `;
 
@@ -1735,6 +2140,22 @@ function renderProfile(){
       state = defaultState(); saveState(); switchTab('profile');
     }
   });
+  $('#btnInstallApp').addEventListener('click', async ()=>{
+    if(deferredPrompt){
+      const dp = deferredPrompt;
+      deferredPrompt = null;
+      dp.prompt();
+      try{ await dp.userChoice; }catch(e){}
+    } else {
+      const ua = navigator.userAgent || '';
+      const isIOS = /iphone|ipad|ipod/i.test(ua) || (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
+      if(isIOS){
+        alert("On iPhone/iPad: tap the Share icon, then \"Add to Home Screen\".");
+      } else {
+        alert("Your browser doesn't support in-app installation right now — look for an \"Install app\" or \"Add to Home Screen\" option in your browser's menu.");
+      }
+    }
+  });
 }
 
 /* ---------- render root ---------- */
@@ -1750,6 +2171,19 @@ function renderAll(){
 }
 if(!state.profile) activeTab='profile';
 switchTab(activeTab);
+
+/* ---------- PWA: install prompt capture + service worker registration ---------- */
+let deferredPrompt = null;
+window.addEventListener('beforeinstallprompt', e=>{
+  e.preventDefault();
+  deferredPrompt = e;
+});
+window.addEventListener('appinstalled', ()=>{ deferredPrompt = null; });
+if('serviceWorker' in navigator){
+  window.addEventListener('load', ()=>{
+    navigator.serviceWorker.register('sw.js').catch(()=>{});
+  });
+}
 </script>
 </body>
 </html>
