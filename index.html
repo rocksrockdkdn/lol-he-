@@ -210,7 +210,7 @@ const KCAL_PER_KG = 7700;            // energy per kg of body-weight change
 const KCAL_PER_KG_WEEKLY = KCAL_PER_KG / 7; // = 1100 kcal/day per kg/week
 
 /* ---------- state ---------- */
-let state = loadState();
+let state; // assigned further below, once ACTIVITY/GOALS/SPLITS/MEAL_SPLITS exist (sanitizeState needs them)
 function defaultState(){
   return {
     profile: null,
@@ -221,15 +221,146 @@ function defaultState(){
     ui: { chartRange: 90, chartTable: false },
   };
 }
+
+// Normalizes arbitrary/untrusted JSON (localStorage or an imported backup) into a
+// fully-typed, in-range state object. Never trusts strings where numbers/enums are
+// expected — a poisoned backup must not be able to inject HTML into numeric render
+// sinks or brick the app with an out-of-domain enum.
+function sanitizeState(raw){
+  const out = defaultState();
+  raw = (raw && typeof raw==='object') ? raw : {};
+  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+  const finite = n => typeof n==='number' && isFinite(n);
+  const numOr0 = v => { const n=Number(v); return finite(n) ? n : 0; };
+  const numOrNull = v => { const n=Number(v); return finite(n) ? n : null; };
+  const hasKey = (obj,k) => typeof k==='string' ? Object.prototype.hasOwnProperty.call(obj,k)
+    : (typeof k==='number' && Object.prototype.hasOwnProperty.call(obj,String(k)));
+
+  // ---- profile ----
+  if(raw.profile && typeof raw.profile==='object'){
+    const rp = raw.profile;
+    let ok = true;
+    const prof = {};
+    prof.sex = (rp.sex==='male' || rp.sex==='female') ? rp.sex : 'male';
+    prof.units = (rp.units==='metric' || rp.units==='imperial') ? rp.units : 'metric';
+
+    const age = Number(rp.age);
+    if(finite(age)) prof.age = clamp(age,13,90); else ok = false;
+
+    const heightCm = Number(rp.heightCm);
+    if(finite(heightCm)) prof.heightCm = clamp(heightCm,120,230); else ok = false;
+
+    const startWeightKg = Number(rp.startWeightKg);
+    if(finite(startWeightKg)) prof.startWeightKg = clamp(startWeightKg,30,300); else ok = false;
+
+    const bodyFat = Number(rp.bodyFat);
+    prof.bodyFat = (finite(bodyFat) && bodyFat>=3 && bodyFat<=60) ? bodyFat : null;
+
+    prof.activity = hasKey(ACTIVITY, rp.activity) ? rp.activity : 'moderate';
+    prof.goal = hasKey(GOALS, rp.goal) ? rp.goal : 'maintain';
+
+    const ratePct = Number(rp.ratePct);
+    prof.ratePct = (finite(ratePct) && ratePct>=0 && ratePct<=2) ? ratePct : 0;
+
+    const goalWeightKg = Number(rp.goalWeightKg);
+    prof.goalWeightKg = (finite(goalWeightKg) && goalWeightKg>=30 && goalWeightKg<=400) ? goalWeightKg : null;
+
+    const daysPerWeek = Number(rp.daysPerWeek);
+    prof.daysPerWeek = (Number.isInteger(daysPerWeek) && hasKey(SPLITS, daysPerWeek)) ? daysPerWeek : 3;
+
+    prof.experience = ['beginner','intermediate','advanced'].includes(rp.experience) ? rp.experience : 'intermediate';
+    prof.equipment = ['gym','dumbbell','home'].includes(rp.equipment) ? rp.equipment : 'gym';
+    prof.diet = ['omnivore','vegetarian','vegan'].includes(rp.diet) ? rp.diet : 'omnivore';
+
+    const mealsPerDay = Number(rp.mealsPerDay);
+    prof.mealsPerDay = (Number.isInteger(mealsPerDay) && hasKey(MEAL_SPLITS, mealsPerDay)) ? mealsPerDay : 4;
+
+    out.profile = ok ? prof : null;
+  }
+
+  // ---- weights ----
+  const rawWeights = Array.isArray(raw.weights) ? raw.weights : [];
+  out.weights = rawWeights
+    .filter(w => w && typeof w==='object' && dateRe.test(w.d) && finite(Number(w.kg)) && Number(w.kg)>=20 && Number(w.kg)<=400)
+    .map(w => ({ d: w.d, kg: Number(w.kg) }))
+    .sort((a,b)=> a.d<b.d?-1:a.d>b.d?1:0)
+    .slice(-5000);
+
+  // ---- measurements ----
+  const rawMeas = Array.isArray(raw.measurements) ? raw.measurements : [];
+  out.measurements = rawMeas
+    .filter(m => m && typeof m==='object' && dateRe.test(m.d))
+    .map(m => ({
+      d: m.d,
+      waist: numOrNull(m.waist), chest: numOrNull(m.chest), hips: numOrNull(m.hips),
+      arm: numOrNull(m.arm), thigh: numOrNull(m.thigh),
+    }))
+    .sort((a,b)=> a.d<b.d?-1:a.d>b.d?1:0)
+    .slice(-2000);
+
+  // ---- coach ----
+  const rc = (raw.coach && typeof raw.coach==='object') ? raw.coach : {};
+  out.coach.adjKcal = clamp(numOr0(rc.adjKcal), -3000, 3000);
+  out.coach.lastCheck = (typeof rc.lastCheck==='string' && dateRe.test(rc.lastCheck)) ? rc.lastCheck : null;
+  const rawHist = Array.isArray(rc.history) ? rc.history : [];
+  out.coach.history = rawHist.slice(-1000).map(h=>{
+    h = (h && typeof h==='object') ? h : {};
+    const rec = {
+      d: (typeof h.d==='string' && dateRe.test(h.d)) ? h.d : '',
+      actual: numOr0(h.actual), target: numOr0(h.target), adj: numOr0(h.adj),
+      before: numOr0(h.before), after: numOr0(h.after),
+      points: numOr0(h.points), span: numOr0(h.span),
+    };
+    if(h.waistDelta!=null){
+      const wd = numOrNull(h.waistDelta);
+      if(wd!=null) rec.waistDelta = wd;
+    }
+    return rec;
+  });
+
+  // ---- ui ----
+  const ru = (raw.ui && typeof raw.ui==='object') ? raw.ui : {};
+  const cr = Number(ru.chartRange);
+  out.ui.chartRange = [0,30,90].includes(cr) ? cr : 90;
+  out.ui.chartTable = !!ru.chartTable;
+
+  // ---- mealPlan ----
+  const rmp = raw.mealPlan;
+  const validMealShape = rmp && typeof rmp==='object' && Array.isArray(rmp.meals)
+    && rmp.meals.every(m => m && typeof m==='object' && Array.isArray(m.items));
+  if(validMealShape){
+    const sanitizeFood = f => (f && typeof f==='object') ? {
+      name: String(f.name||''), cat: String(f.cat||''), unit: String(f.unit||''),
+      kcal: numOr0(f.kcal), p: numOr0(f.p), c: numOr0(f.c), f: numOr0(f.f),
+      tags: Array.isArray(f.tags) ? f.tags.map(String) : [],
+    } : null;
+    const meals = rmp.meals.map(m => ({
+      name: String(m.name||''),
+      tgt: { kcal:numOr0(m.tgt&&m.tgt.kcal), p:numOr0(m.tgt&&m.tgt.p), c:numOr0(m.tgt&&m.tgt.c), f:numOr0(m.tgt&&m.tgt.f) },
+      items: m.items.map(it=>({ food: sanitizeFood(it && it.food), g: clamp(numOr0(it && it.g),0,2000) }))
+                     .filter(it=>it.food),
+    }));
+    const totals = (rmp.totals && typeof rmp.totals==='object')
+      ? { kcal:numOr0(rmp.totals.kcal), p:numOr0(rmp.totals.p), c:numOr0(rmp.totals.c), f:numOr0(rmp.totals.f) }
+      : { kcal:0, p:0, c:0, f:0 };
+    out.mealPlan = {
+      kcalAtGen: numOr0(rmp.kcalAtGen),
+      generated: (typeof rmp.generated==='string' && dateRe.test(rmp.generated)) ? rmp.generated : todayISO(),
+      meals, totals,
+    };
+  } else {
+    out.mealPlan = null;
+  }
+
+  return out;
+}
+
 function loadState(){
   try{
     const raw = localStorage.getItem(LS_KEY);
     if(!raw) return defaultState();
-    const s = JSON.parse(raw);
-    return Object.assign(defaultState(), s, {
-      coach: Object.assign(defaultState().coach, s.coach || {}),
-      ui: Object.assign(defaultState().ui, s.ui || {}),
-    });
+    const parsed = JSON.parse(raw);
+    return sanitizeState(parsed);
   }catch(e){ return defaultState(); }
 }
 function saveState(){ localStorage.setItem(LS_KEY, JSON.stringify(state)); }
@@ -275,7 +406,7 @@ function bmr(p, weightKg){
   const base = 10*weightKg + 6.25*p.heightCm - 5*p.age;
   return p.sex==='male' ? base+5 : base-161;
 }
-function tdee(p, weightKg){ return bmr(p,weightKg) * ACTIVITY[p.activity].mult; }
+function tdee(p, weightKg){ return bmr(p,weightKg) * (ACTIVITY[p.activity]||ACTIVITY.moderate).mult; }
 
 // Trend weight: mean of weigh-ins in the last 7 days (by date of latest entry);
 // falls back to latest weigh-in, then profile start weight.
@@ -290,7 +421,7 @@ function trendWeightKg(){
 }
 function targetRateKgWk(){
   const p = state.profile; if(!p) return 0;
-  const g = GOALS[p.goal];
+  const g = GOALS[p.goal] || GOALS.maintain;
   return g.sign * (p.ratePct/100) * trendWeightKg();
 }
 function calorieFloor(p){ return p.sex==='male' ? 1500 : 1200; }
@@ -389,8 +520,15 @@ function runCheckIn(){
   if(Math.abs(diff) > tol){
     adj = clamp(Math.round(diff*KCAL_PER_KG_WEEKLY/10)*10, -ADJ_CAP, ADJ_CAP);
   }
-  const before = calorieTarget().kcal;
-  state.coach.adjKcal += adj;
+  const ctBefore = calorieTarget();
+  const before = ctBefore.kcal;
+  let newAdj = state.coach.adjKcal + adj;
+  // don't let the integrator wind past the floor — once the target is pinned,
+  // further negative adjustment has no visible effect and should not accumulate.
+  const maint = ctBefore.maintenance, gd = ctBefore.goalDelta, floor = calorieFloor(state.profile);
+  const minAdj = floor - maint - gd;           // adj below this has no effect (already floored)
+  if(newAdj < minAdj) newAdj = Math.max(minAdj, state.coach.adjKcal);  // never accumulate below the effective floor
+  state.coach.adjKcal = clamp(newAdj, -3000, 3000);
   state.coach.lastCheck = todayISO();
   const after = calorieTarget().kcal;
   const rec = { d: todayISO(), actual: round(actual,2), target: round(target,2),
@@ -774,18 +912,25 @@ function generateMealPlan(){
   };
   // Correction passes: close the protein gap with protein portions first,
   // then close the calorie gap with carb portions, fine-tuning with fat.
+  // Iterative/greedy: low-density anchors (lentils, black beans, yogurt...) cap
+  // out well before the gap closes in one pass, so keep redistributing the
+  // remainder across items that still have headroom until it converges.
   {
-    const gapP = mt.protein - dayTotal().p;
-    if(Math.abs(gapP) > 8){
-      const pItems = [];
-      for(const m of meals) for(const it of m.items)
-        if(it.food.cat==='protein' && it.food.p>0) pItems.push(it);
-      if(pItems.length){
-        const per = gapP / pItems.length;
-        for(const it of pItems){
-          const [lo,hi]=portionBounds(it.food);
-          it.g = clamp(it.g + per/(it.food.p/100), lo, hi);
-        }
+    const pItems = [];
+    for(const m of meals) for(const it of m.items)
+      if(it.food.cat==='protein' && it.food.p>0) pItems.push(it);
+    for(let pass=0; pass<6 && pItems.length; pass++){
+      const gapP = mt.protein - dayTotal().p;
+      if(Math.abs(gapP) <= 8) break;
+      const headroom = pItems.filter(it=>{
+        const [lo,hi]=portionBounds(it.food);
+        return gapP>0 ? it.g<hi : it.g>lo;
+      });
+      if(!headroom.length) break;
+      const per = gapP / headroom.length;
+      for(const it of headroom){
+        const [lo,hi]=portionBounds(it.food);
+        it.g = clamp(it.g + per/(it.food.p/100), lo, hi);
       }
     }
   }
@@ -807,8 +952,19 @@ function generateMealPlan(){
     m.items = m.items.filter(it=>it.g>=8);
     for(const it of m.items) it.g = Math.round(it.g/5)*5;
   }
-  return { kcalAtGen: mt.kcal, generated: todayISO(), meals, totals: dayTotal() };
+  const finalTotals = dayTotal();
+  const plan = { kcalAtGen: mt.kcal, generated: todayISO(), meals, totals: finalTotals };
+  const proteinShort = mt.protein - finalTotals.p;
+  const kcalOffPct = mt.kcal>0 ? Math.abs(finalTotals.kcal - mt.kcal)/mt.kcal : 0;
+  if(proteinShort > 12 || kcalOffPct > 0.08){
+    plan.warn = 'This plan falls short of your protein target — add a protein source or regenerate.';
+  }
+  return plan;
 }
+
+// Now that ACTIVITY/GOALS/SPLITS/MEAL_SPLITS are all defined, it's safe to load
+// (and sanitize) persisted state.
+state = loadState();
 
 /* ============================================================
    RENDERING
@@ -835,7 +991,7 @@ function needProfileCard(){
 
 /* ---------- dashboard ---------- */
 function goalDeltaText(){
-  const p=state.profile, g=GOALS[p.goal];
+  const p=state.profile, g=GOALS[p.goal]||GOALS.maintain;
   if(p.goal==='maintain') return 'maintenance';
   const r = targetRateKgWk();
   return `${r>0?'+':''}${kgOut(r,2)} ${wUnit()}/week target`;
@@ -849,23 +1005,24 @@ function renderDashboard(){
   const st = coachStatus();
   const lastAdj = state.coach.history[state.coach.history.length-1];
 
-  // trend delta vs ~7 days ago
+  // trend delta vs ~7 days ago (trend-to-trend, not trend-vs-single-raw-reading)
   let deltaHtml = '';
   const ws = state.weights;
   if(ws.length>=2){
     const lastDay = dayNum(ws[ws.length-1].d);
-    const prior = ws.filter(w=>dayNum(w.d) <= lastDay-7);
+    const series = movingAvgSeries(ws);
+    const prior = series.filter(e=>dayNum(e.d) <= lastDay-7);
     if(prior.length){
-      const d = tw - prior[prior.length-1].kg;
-      const goodDir = GOALS[p.goal].sign || -1;
-      const isGood = (d===0) || (Math.sign(d)===goodDir);
+      const d = tw - prior[prior.length-1].trend;
+      const sign = (GOALS[p.goal]||GOALS.maintain).sign;
+      const isGood = sign===0 ? Math.abs(d) < 0.25 : (Math.sign(d)===sign || d===0);
       deltaHtml = `<div class="delta"><span class="${isGood?'up-good':'down-bad'}">${d>=0?'▲':'▼'} ${Math.abs(kgOut(d,1))} ${wUnit()}</span> vs a week ago</div>`;
     }
   }
 
   c.innerHTML = `
     <h1>Today</h1>
-    <div class="sub">${fmtDateLong(todayISO())} · goal: ${GOALS[p.goal].label.toLowerCase()}</div>
+    <div class="sub">${fmtDateLong(todayISO())} · goal: ${(GOALS[p.goal]||GOALS.maintain).label.toLowerCase()}</div>
 
     <div class="card">
       <div class="label muted" style="font-size:12.5px">Daily calorie target</div>
@@ -873,7 +1030,7 @@ function renderDashboard(){
       <div class="sec" style="font-size:13px;margin-top:4px">
         maintenance ≈ ${ct.maintenance.toLocaleString()} kcal
         ${ct.goalDelta ? ` · ${ct.goalDelta>0?'+':''}${ct.goalDelta} kcal for ${goalDeltaText()}` : ''}
-        ${ct.adj ? ` · <b>${ct.adj>0?'+':''}${ct.adj} kcal coach adjustment</b>` : ''}
+        ${ct.adj ? ` · <b>${Number(ct.adj)>0?'+':''}${Number(ct.adj)} kcal coach adjustment</b>` : ''}
       </div>
       ${ct.floored?`<div class="note warn">Your computed target fell below a safe floor (${calorieFloor(p)} kcal) and was raised to it. Consider a slower rate of loss.</div>`:''}
       <div class="grid cols-auto mt">
@@ -897,7 +1054,7 @@ function renderDashboard(){
       </div>
       <div class="tile">
         <div class="label">Training program</div>
-        <div class="value" style="font-size:17px">${SPLITS[p.daysPerWeek].name}</div>
+        <div class="value" style="font-size:17px">${(SPLITS[p.daysPerWeek]||SPLITS[3]).name}</div>
         <div class="delta">${p.daysPerWeek} days/week · ${esc(p.experience)}</div>
       </div>
     </div>
@@ -918,7 +1075,7 @@ function renderDashboard(){
         <button class="btn ghost" id="btnQuickWeighD">Log today's weight</button>
       </div>
       ${lastAdj?`<div class="note">Last check-in ${fmtDateShort(lastAdj.d)}: measured ${lastAdj.actual>0?'+':''}${kgOut(lastAdj.actual,2)} ${wUnit()}/wk vs target ${lastAdj.target>0?'+':''}${kgOut(lastAdj.target,2)} —
-        ${lastAdj.adj===0?'on track, no change.':`adjusted <b>${lastAdj.adj>0?'+':''}${lastAdj.adj} kcal</b> (${lastAdj.before.toLocaleString()} → ${lastAdj.after.toLocaleString()}).`}
+        ${Number(lastAdj.adj)===0?'on track, no change.':`adjusted <b>${Number(lastAdj.adj)>0?'+':''}${Number(lastAdj.adj)} kcal</b> (${Number(lastAdj.before).toLocaleString()} → ${Number(lastAdj.after).toLocaleString()}).`}
         ${lastAdj.waistDelta!=null?` Waist ${lastAdj.waistDelta>0?'+':''}${cmOut(lastAdj.waistDelta,1)} ${lUnit()} since previous measurement.`:''}</div>`:''}
     </div>
   `;
@@ -957,9 +1114,9 @@ function renderWorkout(){
 
   c.innerHTML = `
     <h1>Your training program</h1>
-    <div class="sub">${SPLITS[p.daysPerWeek].name} · ${p.daysPerWeek} days/week · ${esc(p.equipment==='gym'?'full gym':p.equipment==='dumbbell'?'dumbbells only':'home / minimal equipment')} · ${esc(p.experience)}</div>
+    <div class="sub">${(SPLITS[p.daysPerWeek]||SPLITS[3]).name} · ${p.daysPerWeek} days/week · ${esc(p.equipment==='gym'?'full gym':p.equipment==='dumbbell'?'dumbbells only':'home / minimal equipment')} · ${esc(p.experience)}</div>
 
-    <div class="card"><p class="sec" style="font-size:13.5px">${SPLITS[p.daysPerWeek].why}
+    <div class="card"><p class="sec" style="font-size:13.5px">${(SPLITS[p.daysPerWeek]||SPLITS[3]).why}
       Rep targets are chosen for hypertrophy (mostly 6–12 on compounds, 10–20 on isolation), taken close to failure
       (<b>RIR</b> = reps in reserve — stop ${prog.rir} reps short of failure).</p></div>
 
@@ -1011,9 +1168,11 @@ function meterRow(label, actual, target, unit){
 function renderNutrition(){
   const c = $('#tab-nutrition');
   if(!state.profile){ c.innerHTML = needProfileCard(); return; }
+  const p = state.profile;
   const mt = macroTargets();
   const plan = state.mealPlan;
-  const stale = plan && Math.abs(plan.kcalAtGen - mt.kcal) > 30;
+  const stale = plan && (Math.abs(plan.kcalAtGen - mt.kcal) > 30
+    || plan.meals.length !== (MEAL_SPLITS[p.mealsPerDay]||MEAL_SPLITS[3]).length);
 
   let planHtml = '';
   if(plan){
@@ -1038,7 +1197,7 @@ function renderNutrition(){
         ${meterRow('Protein', plan.totals.p, mt.protein, 'g')}
         ${meterRow('Carbs', plan.totals.c, mt.carbs, 'g')}
         ${meterRow('Fat', plan.totals.f, mt.fat, 'g')}
-        <p class="muted" style="font-size:12.5px">Portions are rounded to 5 g, so totals can drift a little — anything within ~5% of target is on plan.</p>
+        ${plan.warn?`<div class="note warn">${esc(plan.warn)}</div>`:`<p class="muted" style="font-size:12.5px">Portions are rounded to 5 g, so totals can drift a little — anything within ~5% of target is on plan.</p>`}
       </div>`;
   }
 
@@ -1089,7 +1248,11 @@ function renderNutrition(){
   $$('#tab-nutrition [data-remeal]').forEach(b=>b.addEventListener('click', ()=>{
     const i = +b.dataset.remeal;
     const fresh = generateMealPlan();
-    if(state.mealPlan && fresh){
+    if(!fresh) return;
+    if(!state.mealPlan || !fresh.meals[i]){
+      // stored plan has a different meal count than today's mealsPerDay — replace it wholesale
+      state.mealPlan = fresh;
+    } else {
       state.mealPlan.meals[i] = fresh.meals[i];
       // recompute totals
       const t={kcal:0,p:0,c:0,f:0};
@@ -1097,8 +1260,8 @@ function renderNutrition(){
         const x=macrosFor(it.food,it.g); t.kcal+=x.kcal;t.p+=x.p;t.c+=x.c;t.f+=x.f;
       }
       state.mealPlan.totals = t;
-      saveState(); renderNutrition();
     }
+    saveState(); renderNutrition();
   }));
 
   // portion calculator
@@ -1125,12 +1288,17 @@ function renderNutrition(){
 }
 
 /* ---------- progress tab (weight chart + measurements) ---------- */
+// entries must already be sorted ascending by date (true everywhere this is called).
+// O(n) two-pointer sliding window instead of an O(n^2) filter-per-element pass.
 function movingAvgSeries(entries){
-  return entries.map(e=>{
-    const cutoff = dayNum(e.d)-6;
-    const win = entries.filter(w=>dayNum(w.d)>=cutoff && dayNum(w.d)<=dayNum(e.d));
-    return { d: e.d, kg: e.kg, trend: sum(win.map(w=>w.kg))/win.length };
-  });
+  const days = entries.map(e=>dayNum(e.d));
+  const out = []; let lo = 0, sum = 0;
+  for(let i=0;i<entries.length;i++){
+    sum += entries[i].kg;
+    while(days[lo] < days[i]-6){ sum -= entries[lo].kg; lo++; }
+    out.push({ d: entries[i].d, kg: entries[i].kg, trend: sum/(i-lo+1) });
+  }
+  return out;
 }
 function niceTicks(min,max,count){
   const span = max-min || 1;
@@ -1232,14 +1400,14 @@ function renderProgress(){
 
   const wRows = ws.slice(0,60).map(w=>{
     return `<tr><td>${fmtDateShort(w.d)}</td><td class="num">${kgOut(w.kg,1)} ${wUnit()}</td>
-      <td class="num"><button class="btn ghost small" data-delw="${w.d}">✕</button></td></tr>`;
+      <td class="num"><button class="btn ghost small" data-delw="${esc(w.d)}">✕</button></td></tr>`;
   }).join('');
 
   const mFields = ['waist','chest','hips','arm','thigh'];
   const mRows = ms.slice(0,30).map(m=>`<tr>
     <td>${fmtDateShort(m.d)}</td>
     ${mFields.map(f=>`<td class="num">${m[f]!=null?cmOut(m[f],1):'—'}</td>`).join('')}
-    <td class="num"><button class="btn ghost small" data-delm="${m.d}">✕</button></td></tr>`).join('');
+    <td class="num"><button class="btn ghost small" data-delm="${esc(m.d)}">✕</button></td></tr>`).join('');
 
   const trendData = movingAvgSeries(state.weights);
   const tableView = state.ui.chartTable ? `
@@ -1251,11 +1419,14 @@ function renderProgress(){
   const hist = state.coach.history.slice().reverse();
   const histHtml = hist.length ? `<table class="data">
       <thead><tr><th>Date</th><th class="num">Measured (${wUnit()}/wk)</th><th class="num">Target</th><th class="num">Change</th><th class="num">New target</th></tr></thead>
-      <tbody>${hist.map(h=>`<tr><td>${fmtDateShort(h.d)}</td>
+      <tbody>${hist.map(h=>{
+        const adjN = Number(h.adj)||0;
+        return `<tr><td>${fmtDateShort(h.d)}</td>
         <td class="num">${h.actual>0?'+':''}${kgOut(h.actual,2)}</td>
         <td class="num">${h.target>0?'+':''}${kgOut(h.target,2)}</td>
-        <td class="num">${h.adj===0?'—':(h.adj>0?'+':'')+h.adj+' kcal'}</td>
-        <td class="num">${h.after.toLocaleString()} kcal</td></tr>`).join('')}</tbody>
+        <td class="num">${adjN===0?'—':(adjN>0?'+':'')+adjN+' kcal'}</td>
+        <td class="num">${(Number(h.after)||0).toLocaleString()} kcal</td></tr>`;
+      }).join('')}</tbody>
     </table>` : `<p class="sec" style="font-size:13.5px">No check-ins yet — the coach adjusts your calories here once you have enough weigh-ins.</p>`;
 
   c.innerHTML = `
@@ -1354,8 +1525,10 @@ function renderProfile(){
   const goal = p.goal || 'cut';
   const rates = GOALS[goal].rates;
   const heightCm = p.heightCm || null;
-  const hFt = heightCm ? Math.floor(heightCm/CM_PER_IN/12) : '';
-  const hIn = heightCm ? round(heightCm/CM_PER_IN - hFt*12,1) : '';
+  const tiRaw = heightCm ? heightCm/CM_PER_IN : null;
+  const ti = tiRaw!=null ? Math.round(tiRaw*2)/2 : null;   // total inches snapped to the 0.5 grid
+  const hFt = ti!=null ? Math.floor(ti/12) : '';
+  const hIn = ti!=null ? round(ti - hFt*12, 1) : '';
   const wDisp = p.startWeightKg ? round(imp? p.startWeightKg/KG_PER_LB : p.startWeightKg,1) : '';
   const gwDisp = p.goalWeightKg ? round(imp? p.goalWeightKg/KG_PER_LB : p.goalWeightKg,1) : '';
 
@@ -1364,7 +1537,7 @@ function renderProfile(){
     <div class="sub">Everything below drives your program, calories and meal plans. You can change it any time.</div>
 
     <div class="card">
-      <form id="profForm">
+      <form id="profForm" novalidate>
         <h2>👤 About you</h2>
         <div class="row">
           <div class="field"><label class="f">Units</label>
@@ -1382,7 +1555,7 @@ function renderProfile(){
             <input id="fHeightCm" type="number" min="120" max="230" step="0.5" value="${heightCm?round(heightCm,1):''}"></div>
           <div class="field" id="hImp" ${imp?'':'style="display:none"'}><label class="f">Height</label>
             <div class="row"><input id="fHeightFt" type="number" min="4" max="7" placeholder="ft" value="${imp?hFt:''}" style="flex:1">
-            <input id="fHeightIn" type="number" min="0" max="11.5" step="0.5" placeholder="in" value="${imp?hIn:''}" style="flex:1"></div></div>
+            <input id="fHeightIn" type="number" min="0" max="11.9" step="0.5" placeholder="in" value="${imp?hIn:''}" style="flex:1"></div></div>
           <div class="field"><label class="f">Current weight (<span class="uW">${imp?'lb':'kg'}</span>)</label>
             <input id="fWeight" type="number" min="1" step="0.1" value="${wDisp}" required></div>
           <div class="field"><label class="f">Body fat % <span class="muted">(optional)</span></label>
@@ -1476,6 +1649,10 @@ function renderProfile(){
     if(!(heightCm2>=120&&heightCm2<=230)){ alert('Please enter a height between 120–230 cm (about 4\'0"–7\'6").'); return; }
     if(!(weightKg>=30&&weightKg<=300)){ alert('Please enter a weight between 30–300 kg (66–660 lb).'); return; }
     const bf = parseFloat($('#fBf').value);
+    const oldProfile = state.profile;
+    const newGoal = $('#fGoal').value;
+    const newRatePct = parseFloat($('#fRate').value);
+    const newMealsPerDay = +$('#fMeals').value;
     state.profile = {
       units: $('#fUnits').value,
       sex: $('#fSex').value,
@@ -1484,15 +1661,23 @@ function renderProfile(){
       startWeightKg: round(weightKg,2),
       bodyFat: bf>0?bf:null,
       activity: $('#fActivity').value,
-      goal: $('#fGoal').value,
-      ratePct: parseFloat($('#fRate').value),
+      goal: newGoal,
+      ratePct: newRatePct,
       goalWeightKg: goalWeightKg?round(goalWeightKg,2):null,
       daysPerWeek: +$('#fDays').value,
       experience: $('#fExp').value,
       equipment: $('#fEquip').value,
       diet: $('#fDiet').value,
-      mealsPerDay: +$('#fMeals').value,
+      mealsPerDay: newMealsPerDay,
     };
+    // an adjustment learned under one goal/rate is invalid under another — start fresh
+    if(!oldProfile || oldProfile.goal !== newGoal || oldProfile.ratePct !== newRatePct){
+      state.coach = { adjKcal: 0, lastCheck: null, history: [] };
+    }
+    // a stored plan was sized for the old meal count — invalidate it so it regenerates cleanly
+    if(oldProfile && oldProfile.mealsPerDay !== newMealsPerDay){
+      state.mealPlan = null;
+    }
     // seed today's weigh-in if none for today
     const t = todayISO();
     if(!state.weights.some(w=>w.d===t)){
@@ -1518,8 +1703,15 @@ function renderProfile(){
       try{
         const s = JSON.parse(rd.result);
         if(!s || typeof s!=='object' || !('weights' in s)) throw new Error('bad');
-        state = Object.assign(defaultState(), s);
-        saveState(); renderAll();
+        const next = sanitizeState(s);
+        const prev = state;
+        state = next;
+        try{ renderAll(); }catch(renderErr){
+          state = prev; renderAll();
+          alert("That backup couldn't be loaded.");
+          return;
+        }
+        saveState();
         alert('Backup imported.');
       }catch(err){ alert('That file doesn\'t look like a LiftLab backup.'); }
     };
@@ -1534,11 +1726,9 @@ function renderProfile(){
 
 /* ---------- render root ---------- */
 function renderAll(){
-  renderDashboard();
-  renderWorkout();
-  renderNutrition();
-  renderProgress();
-  renderProfile();
+  for(const fn of [renderDashboard,renderWorkout,renderNutrition,renderProgress,renderProfile]){
+    try{ fn(); }catch(e){ console.error('render error in '+fn.name, e); }
+  }
 }
 if(!state.profile) activeTab='profile';
 switchTab(activeTab);
