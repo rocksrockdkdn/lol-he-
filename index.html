@@ -347,6 +347,7 @@ function sanitizeState(raw){
       kcalAtGen: numOr0(rmp.kcalAtGen),
       generated: (typeof rmp.generated==='string' && dateRe.test(rmp.generated)) ? rmp.generated : todayISO(),
       meals, totals,
+      warn: typeof rmp.warn==='string' ? rmp.warn.slice(0,200) : undefined,
     };
   } else {
     out.mealPlan = null;
@@ -522,17 +523,27 @@ function runCheckIn(){
   }
   const ctBefore = calorieTarget();
   const before = ctBefore.kcal;
-  let newAdj = state.coach.adjKcal + adj;
-  // don't let the integrator wind past the floor — once the target is pinned,
-  // further negative adjustment has no visible effect and should not accumulate.
+  const prevAdj = state.coach.adjKcal;
+  let newAdj = prevAdj + adj;
+  // Anti-windup: never accumulate the integrator more negative than the point where the
+  // target already hits its floor — further cuts have no visible effect and only create
+  // hidden debt that has to be unwound later.
   const maint = ctBefore.maintenance, gd = ctBefore.goalDelta, floor = calorieFloor(state.profile);
-  const minAdj = floor - maint - gd;           // adj below this has no effect (already floored)
-  if(newAdj < minAdj) newAdj = Math.max(minAdj, state.coach.adjKcal);  // never accumulate below the effective floor
+  const minAdj = floor - maint - gd;           // adjKcal at/below which the target is floored
+  if(newAdj < minAdj) newAdj = minAdj;
+  // ...but the clamp must never move the adjustment OPPOSITE to the intended direction.
+  // When the baseline is already floored (minAdj>0) an intended cut (adj<=0) must not be
+  // flipped into a calorie increase, and an intended raise must not be flipped into a cut.
+  if(adj <= 0 && newAdj > prevAdj) newAdj = prevAdj;
+  if(adj >  0 && newAdj < prevAdj) newAdj = prevAdj;
   state.coach.adjKcal = clamp(newAdj, -3000, 3000);
   state.coach.lastCheck = todayISO();
   const after = calorieTarget().kcal;
+  // Record the APPLIED change (may be 0 when anti-windup suppresses it) so the history
+  // table never claims a cut that had no effect.
+  const appliedAdj = state.coach.adjKcal - prevAdj;
   const rec = { d: todayISO(), actual: round(actual,2), target: round(target,2),
-                adj, before, after, points: st.count, span: st.span };
+                adj: appliedAdj, before, after, points: st.count, span: st.span };
   state.coach.history.push(rec);
   // waist corroboration note
   const waists = state.measurements.filter(m=>m.waist!=null);
@@ -1706,7 +1717,9 @@ function renderProfile(){
         const next = sanitizeState(s);
         const prev = state;
         state = next;
-        try{ renderAll(); }catch(renderErr){
+        // Render BEFORE persisting; if any panel fails to render, roll back to the
+        // previous (known-good) state and do not save, so a bad backup can't stick.
+        if(!renderAll()){
           state = prev; renderAll();
           alert("That backup couldn't be loaded.");
           return;
@@ -1725,10 +1738,15 @@ function renderProfile(){
 }
 
 /* ---------- render root ---------- */
+// Renders every panel, each isolated so one failing panel can't hide the others
+// (notably the Profile tab's Reset button). Returns false if any panel threw, so the
+// import handler can roll back a backup that fails to render instead of persisting it.
 function renderAll(){
+  let ok = true;
   for(const fn of [renderDashboard,renderWorkout,renderNutrition,renderProgress,renderProfile]){
-    try{ fn(); }catch(e){ console.error('render error in '+fn.name, e); }
+    try{ fn(); }catch(e){ console.error('render error in '+fn.name, e); ok = false; }
   }
+  return ok;
 }
 if(!state.profile) activeTab='profile';
 switchTab(activeTab);
