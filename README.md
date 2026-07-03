@@ -51,6 +51,10 @@ backup between your computer and phone.
 - **Portion calculator**: pick any food and size a portion by grams, protein, or calories
 - **Daily food diary**: log what you actually eat and watch it stack up against your calorie
   and macro targets, with a live "remaining today" readout
+- **Branded foods (online)**: search Open Food Facts (millions of packaged foods) or scan/type
+  a product barcode (camera scan on Android Chrome; typed barcode everywhere). Saved foods
+  work offline afterwards in the diary and portion calculator. This is the only feature that
+  uses the internet — everything else stays fully offline.
 - Safety floors on calories with clear warnings
 
 ### 📈 Tracking & adaptive calories

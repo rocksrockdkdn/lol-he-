@@ -1,6 +1,6 @@
 /* LiftLab service worker — offline app shell.
    Bump CACHE when index.html or assets change so clients update. */
-const CACHE = 'liftlab-v2';
+const CACHE = 'liftlab-v3';
 const ASSETS = [
   './',
   './index.html',
