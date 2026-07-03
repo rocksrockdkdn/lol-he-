@@ -1,0 +1,22 @@
+kind: LLMConfig
+version: 0.1
+metadata:
+  name: an-openai-deployed-model
+  labels:
+    provider: OpenAI
+spec:
+  description: "Model used to do ABC"
+  provider:
+    name: OpenAI
+    openAISpec:
+      # https://platform.openai.com/docs/models/
+      model: gpt-4o-mini-2024-07-18
+      timeout: 60
+      # specify API key directly
+      apiKey: sk-my-api-key
+      # or use environment variable (recommended)
+#      apiKey:
+#        fromEnvVar: OPENAI_API_KEY
+  parameters:
+    n: 1
+    temperature: 0

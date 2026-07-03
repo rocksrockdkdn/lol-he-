@@ -1,0 +1,28 @@
+python-dotenv~=1.0
+httpx>=0.25.1
+requests~=2.0
+progressbar~=2.5
+more-itertools~=10.0
+
+Jinja2~=3.1.2
+tiktoken~=0.7
+toml~=0.10.2
+PyYAML~=6.0.1
+
+# LLMs
+anthropic~=0.34.2
+google-generativeai>=0.7.0
+ollama~=0.3.3
+groq~=0.12.0
+
+# Skills
+## Google
+google-api-python-client>=2.106.0
+GoogleNews>=1.6.10
+
+## Wikipedia
+pymediawiki~=0.7.3
+beautifulsoup4~=4.12.2
+
+# Response Parsers
+pydantic==2.8.*
