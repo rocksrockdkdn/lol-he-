@@ -984,12 +984,13 @@ function generateMealPlan(){
                : (mainProt.length?mainProt:proteins);
     const pf = pick(pool);
     items.push({food:pf, g: solveGramsForProtein(pf, Math.max(0, tgt.p - soFar().p))});
-    // 3) carb filler
-    const cpool = isBfast && bfastCarb.length ? bfastCarb : mainCarb;
-    if(!isSnack){
+    // 3) carb filler — fall back through subpool → full carb pool so excluding a whole
+    //    subcategory (e.g. all non-breakfast carbs) can never empty the pick and crash.
+    const cpool = isBfast && bfastCarb.length ? bfastCarb : (mainCarb.length ? mainCarb : carbs);
+    if(!isSnack && cpool.length){
       const cf = pick(cpool);
       const rem = tgt.c - soFar().c;
-      if(rem > 5 && cf.c>0){
+      if(cf && rem > 5 && cf.c>0){
         const [lo,hi]=portionBounds(cf);
         items.push({food:cf, g: clamp(rem/cf.c*100, lo, hi)});
       }
