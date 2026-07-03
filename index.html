@@ -230,6 +230,7 @@ function defaultState(){
     foodLog: [],          // [{d, items:[{name, g}]}] one entry per day
     water: [],             // [{d, ml}] one entry per day
     customFoods: [],       // branded foods saved from online lookup: {name, kcal, p, c, f, unit, barcode} per 100 g
+    excludedFoods: [],     // built-in food names the user has turned OFF for auto meal plans
   };
 }
 
@@ -428,6 +429,13 @@ function sanitizeState(raw){
     .map(w => ({ d: w.d, ml: clamp(numOr0(w.ml),0,30000) }))
     .sort((a,b)=> a.d<b.d?-1:a.d>b.d?1:0)
     .slice(-3660);
+
+  // ---- excludedFoods (meal-plan food preferences) — only real built-in food names ----
+  const validNames = (typeof FOODS !== 'undefined') ? new Set(FOODS.map(f=>f.name)) : null;
+  const rawEx = Array.isArray(raw.excludedFoods) ? raw.excludedFoods : [];
+  out.excludedFoods = [...new Set(rawEx.map(String))]
+    .filter(n => !validNames || validNames.has(n))
+    .slice(0, 300);
 
   return out;
 }
@@ -936,15 +944,21 @@ function generateMealPlan(){
   const split = MEAL_SPLITS[p.mealsPerDay] || MEAL_SPLITS[3];
   const diet = p.diet;
 
-  const proteins  = FOODS.filter(x=>x.cat==='protein' && dietOk(x,diet));
+  // Honor the user's food picks: drop excluded foods from each category, but never
+  // let a whole category go empty (fall back to the full diet-appropriate set so a
+  // valid plan can always be built even if the user unchecks everything in a group).
+  const excluded = new Set(state.excludedFoods || []);
+  const applyPref = list => { const kept = list.filter(x=>!excluded.has(x.name)); return kept.length ? kept : list; };
+
+  const proteins  = applyPref(FOODS.filter(x=>x.cat==='protein' && dietOk(x,diet)));
   const bfastProt = proteins.filter(x=>x.tags.includes('bfast'));
   const mainProt  = proteins.filter(x=>!x.tags.includes('bfast') || diet==='vegan' || diet==='vegetarian');
-  const carbs     = FOODS.filter(x=>x.cat==='carb' && dietOk(x,diet));
+  const carbs     = applyPref(FOODS.filter(x=>x.cat==='carb' && dietOk(x,diet)));
   const bfastCarb = carbs.filter(x=>x.tags.includes('bfastc'));
   const mainCarb  = carbs.filter(x=>!x.tags.includes('bfastc'));
-  const fats      = FOODS.filter(x=>x.cat==='fat' && dietOk(x,diet));
-  const vegs      = FOODS.filter(x=>x.cat==='veg');
-  const fruits    = FOODS.filter(x=>x.cat==='fruit');
+  const fats      = applyPref(FOODS.filter(x=>x.cat==='fat' && dietOk(x,diet)));
+  const vegs      = applyPref(FOODS.filter(x=>x.cat==='veg'));
+  const fruits    = applyPref(FOODS.filter(x=>x.cat==='fruit'));
   const snackProt = proteins.filter(x=>x.tags.includes('bfast')); // yogurt/whey/cottage-style
 
   const meals = split.map(ms=>{
@@ -1078,6 +1092,7 @@ function foodLookup(name){
    saved into state.customFoods and work offline afterwards.
    ============================================================ */
 const offUI = { results: [], status: '' };   // not persisted
+let foodPickerOpen = false;                   // keep the food picker <details> open across re-renders
 function normalizeOffProduct(p){
   if(!p || typeof p!=='object') return null;
   const n = (p.nutriments && typeof p.nutriments==='object') ? p.nutriments : {};
@@ -1767,6 +1782,36 @@ function renderNutrition(){
         Community data — double-check the label if a number looks off.</p>
     </div>`;
 
+  // ---- meal-plan food picker (which foods the auto planner may use) ----
+  const exSet = new Set(state.excludedFoods||[]);
+  const dietFoods = FOODS.filter(f=>dietOk(f, p.diet));
+  const pickGroups = [
+    {cat:'protein', label:'Protein'}, {cat:'carb', label:'Carbs'}, {cat:'fat', label:'Fats & extras'},
+    {cat:'veg', label:'Vegetables'}, {cat:'fruit', label:'Fruit'},
+  ];
+  const pickGroupsHtml = pickGroups.map(g=>{
+    const items = dietFoods.filter(f=>f.cat===g.cat);
+    if(!items.length) return '';
+    const on = items.filter(f=>!exSet.has(f.name)).length;
+    return `<div style="margin:10px 0">
+      <div style="font-size:13px;margin-bottom:5px"><b>${g.label}</b>
+        <span class="muted" data-pickcount="${g.cat}">(${on}/${items.length})</span>
+        <button type="button" class="btn ghost small" data-pickall="${g.cat}" style="padding:2px 8px;margin-left:4px">all</button>
+        <button type="button" class="btn ghost small" data-picknone="${g.cat}" style="padding:2px 8px">none</button></div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px 16px">${items.map(f=>`
+        <label style="display:inline-flex;align-items:center;gap:5px;font-size:13px;color:var(--text-secondary)">
+          <input type="checkbox" data-foodpref="${esc(f.name)}" data-cat="${g.cat}" ${exSet.has(f.name)?'':'checked'} style="width:auto">
+          ${esc(f.name)}</label>`).join('')}</div>
+    </div>`;
+  }).join('');
+  const includedCount = dietFoods.filter(f=>!exSet.has(f.name)).length;
+  const foodPickerHtml = `<details class="mt" id="foodPicker"${foodPickerOpen?' open':''}>
+    <summary>🥗 Choose foods for the plan (<span id="pickSummary">${includedCount} of ${dietFoods.length}</span> selected)</summary>
+    <p class="muted mt" style="font-size:12.5px">Uncheck anything you don't want the auto meal plan to use, then press <b>Generate</b>.
+      Your picks are saved. (Unchecking every food in a group just lets the planner use that group anyway, so a full plan can always be built. Branded foods you saved above aren't used by the auto planner — add those in the diary.)</p>
+    ${pickGroupsHtml}
+  </details>`;
+
   c.innerHTML = `
     <h1>Nutrition</h1>
     <div class="sub">Targets: ${mt.kcal.toLocaleString()} kcal · ${mt.protein} g protein · ${mt.carbs} g carbs · ${mt.fat} g fat</div>
@@ -1779,6 +1824,7 @@ function renderNutrition(){
       <h2>🍽️ Today's meal plan</h2>
       <p class="sec" style="font-size:13.5px">Auto-built from whole foods to hit your targets — portions are computed per food, so a
         palm of chicken and a scoop of whey are sized differently for the same protein. Swap any meal you don't like.</p>
+      ${foodPickerHtml}
       <div class="btnrow mt">
         <button class="btn" id="btnGenPlan">${plan?'Regenerate full plan':'Generate meal plan'}</button>
       </div>
@@ -1809,6 +1855,44 @@ function renderNutrition(){
   $('#btnGenPlan').addEventListener('click', ()=>{
     state.mealPlan = generateMealPlan(); saveState(); renderNutrition();
   });
+
+  // ---- meal-plan food picker ----
+  const foodPickerEl = $('#foodPicker');
+  if(foodPickerEl){
+    foodPickerEl.addEventListener('toggle', ()=>{ foodPickerOpen = foodPickerEl.open; });
+    // Rebuild the exclusion list from the current checkboxes (preserving exclusions for
+    // foods not shown in the picker, e.g. non-diet foods) and persist — no full re-render,
+    // so the picker stays open and responsive.
+    const rebuildPrefs = ()=>{
+      const boxes = $$('#tab-nutrition [data-foodpref]');
+      const shown = new Set(boxes.map(cb=>cb.dataset.foodpref));
+      const uncheckedShown = boxes.filter(cb=>!cb.checked).map(cb=>cb.dataset.foodpref);
+      const preservedHidden = (state.excludedFoods||[]).filter(n=>!shown.has(n));
+      state.excludedFoods = [...new Set([...preservedHidden, ...uncheckedShown])];
+      saveState();
+    };
+    const refreshCounts = ()=>{
+      const boxes = $$('#tab-nutrition [data-foodpref]');
+      let totOn=0;
+      for(const g of ['protein','carb','fat','veg','fruit']){
+        const inG = boxes.filter(cb=>cb.dataset.cat===g);
+        if(!inG.length) continue;
+        const on = inG.filter(cb=>cb.checked).length; totOn += on;
+        const span = document.querySelector(`#tab-nutrition [data-pickcount="${g}"]`);
+        if(span) span.textContent = `(${on}/${inG.length})`;
+      }
+      const sum = $('#pickSummary'); if(sum) sum.textContent = `${totOn} of ${boxes.length}`;
+    };
+    $$('#tab-nutrition [data-foodpref]').forEach(cb=>cb.addEventListener('change', ()=>{ rebuildPrefs(); refreshCounts(); }));
+    $$('#tab-nutrition [data-pickall]').forEach(b=>b.addEventListener('click', ()=>{
+      $$(`#tab-nutrition [data-foodpref][data-cat="${b.dataset.pickall}"]`).forEach(cb=>cb.checked=true);
+      rebuildPrefs(); refreshCounts();
+    }));
+    $$('#tab-nutrition [data-picknone]').forEach(b=>b.addEventListener('click', ()=>{
+      $$(`#tab-nutrition [data-foodpref][data-cat="${b.dataset.picknone}"]`).forEach(cb=>cb.checked=false);
+      rebuildPrefs(); refreshCounts();
+    }));
+  }
   $$('#tab-nutrition [data-remeal]').forEach(b=>b.addEventListener('click', ()=>{
     const i = +b.dataset.remeal;
     const fresh = generateMealPlan();
